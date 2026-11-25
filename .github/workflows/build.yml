@@ -1,0 +1,78 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Prepare fonts and signing key
+        shell: bash
+        run: |
+          mkdir -p app/src/main/res/font
+          if [ ! -f app/src/main/res/font/readex_regular.ttf ]; then
+            python3 -m pip install --quiet --break-system-packages fonttools || python3 -m pip install --quiet fonttools
+            curl -sSfL -o /tmp/readex.ttf "https://raw.githubusercontent.com/google/fonts/main/ofl/readexpro/ReadexPro%5BHEXP%2Cwght%5D.ttf"
+            for p in 400:regular 500:medium 600:semibold 700:bold; do
+              python3 -m fontTools.varLib.instancer /tmp/readex.ttf wght=${p%%:*} HEXP=0 -q -o app/src/main/res/font/readex_${p##*:}.ttf
+            done
+          fi
+          if [ ! -f keystore/release.jks ]; then base64 -d keystore/release.jks.b64 > keystore/release.jks; fi
+          ls -la app/src/main/res/font keystore
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Publish release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NAME="MyFiles-v1.0.${{ github.run_number }}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$NAME"
+          gh release create "v1.0.${{ github.run_number }}" "$NAME" \
+            --title "ملفاتي 1.0.${{ github.run_number }}" \
+            --notes "نسخة مبنية تلقائيًا من آخر تعديل. نزّل ملف APK وثبّته على جهازك."
+
+      - name: Save error log
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "run ${{ github.run_number }} commit ${{ github.sha }}"
+            grep -E "^e: |error:|What went wrong|Could not|FAILED|Unresolved|> " build.log | head -250 || true
+            echo "------ tail ------"
+            tail -120 build.log || true
+          } > errors.txt
+          git config user.name "ci"
+          git config user.email "ci@users.noreply.github.com"
+          git config commit.gpgsign false
+          git checkout --orphan ci-logs
+          git rm -rf --cached . > /dev/null
+          git add -f errors.txt
+          git commit -m "build log ${{ github.run_number }}"
+          git push -f origin ci-logs
